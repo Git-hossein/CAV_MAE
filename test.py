@@ -61,6 +61,55 @@ def get_model(ckpt_path: str = None):
     return _model_instance
 
 
+# =====================================================================
+# 1.5 CUSTOM FORWARD PASS
+# =====================================================================
+
+def forward_audio_only(model: torch.nn.Module, a: torch.Tensor) -> torch.Tensor:
+    """Executes ONLY the audio pipeline of CAV-MAE.
+
+    Input `a`: [B, 1024, 128] Output: [B, 512, 768]
+    """
+    # 1. Patch projection & modality embeddings
+    a = a.unsqueeze(1)
+    a = a.transpose(2, 3)
+    a = model.patch_embed_a(a)
+    a = a + model.pos_embed_a
+    a = a + model.modality_a
+
+    # 2. Audio-specific Transformer blocks
+    for blk in model.blocks_a:
+        a = blk(a)
+
+    # 3. Unified blocks routed to audio normalization
+    for blk in model.blocks_u:
+        a = blk(a, "a")
+
+    a = model.norm_a(a)
+    return a
+
+
+def forward_video_only(model: torch.nn.Module, v: torch.Tensor) -> torch.Tensor:
+    """Executes ONLY the video pipeline of CAV-MAE.
+
+    Input `v`: [B, 3, 224, 224] Output: [B, 196, 768]
+    """
+    # 1. Patch projection & modality embeddings
+    v = model.patch_embed_v(v)
+    v = v + model.pos_embed_v
+    v = v + model.modality_v
+
+    # 2. Visual-specific Transformer blocks
+    for blk in model.blocks_v:
+        v = blk(v)
+
+    # 3. Unified blocks routed to visual normalization
+    for blk in model.blocks_u:
+        v = blk(v, "v")
+
+    v = model.norm_v(v)
+    return v
+
 
 # =====================================================================
 # 2. AUDIO BATCH EXTRACTION FUNCTION
@@ -158,12 +207,9 @@ def extract_audio_frames(
             # 1. Preprocess audio: [1, 1024, 128]
             audio_tensor = preprocess_audio(str(wav_file)).to(device)
 
-            # 2. Matching dummy video tensor with identical batch size [1, 3, 224, 224]
-            dummy_video = torch.zeros((1, 3, 224, 224), device=device)
-
             # 3. Extract features via forward_feat
             with torch.no_grad():
-                audio_tokens, _ = model.forward_feat(audio_tensor, dummy_video)
+                audio_tokens = forward_audio_only(model, audio_tensor)
 
                 # Mean-pool over 512 patch tokens -> [1, 768]
                 audio_emb = audio_tokens.mean(dim=1)
@@ -259,9 +305,6 @@ def extract_video_embeddings_from_folders(
         f"▶️ Found {len(video_folders)} video directories. Starting extraction..."
     )
 
-    # Dummy audio matching the number of frames passed simultaneously: [num_frames, 1024, 128]
-    dummy_audio = torch.zeros(num_frames, 1024, 128, device=device)
-
     saved_count = 0
     for folder in video_folders:
         out_file = out_dir / f"{folder.name}.npy"
@@ -278,7 +321,7 @@ def extract_video_embeddings_from_folders(
             # 2. Extract features
             with torch.no_grad():
                 # video_tokens shape: [num_frames, 196, 768]
-                _, video_tokens = model.forward_feat(dummy_audio, video_tensor)
+                video_tokens = forward_video_only(model, video_tensor)
 
                 # Mean pool across 196 spatial tokens per frame -> [num_frames, 768]
                 frame_embs = video_tokens.mean(dim=1)
@@ -372,44 +415,44 @@ def start_server(port: int = 8000):
 
 
 if __name__ == "__main__":
-    # # Test extraction directly on local sample folder
-    # extract_audio_frames(
-    #     input_folder="/home/hossein/Desktop/test_now", output_folder="/home/hossein/Desktop/test_now", ckpt_path=CAV_MAE_Scale_plusplus
-    # )
-    # extract_video_embeddings_from_folders(
-    #     parent_frames_dir="/home/hossein/Desktop/test_now", output_folder="/home/hossein/Desktop/test_now", ckpt_path= CAV_MAE_Scale_plusplus, num_frames=10
-    # )
+    # Test extraction directly on local sample folder
+    extract_audio_frames(
+        input_folder="/home/hossein/Desktop/test_now", output_folder="/home/hossein/Desktop/test_now", ckpt_path=CAV_MAE_Scale_plusplus
+    )
+    extract_video_embeddings_from_folders(
+        parent_frames_dir="/home/hossein/Desktop/test_now", output_folder="/home/hossein/Desktop/test_now", ckpt_path= CAV_MAE_Scale_plusplus, num_frames=5
+    )
 
 
-    # def compute_similarity(audio_npy_path: str, video_npy_path: str):
-    #     # Load and ensure 1D shape (768,)
-    #     audio_emb = np.load(audio_npy_path).reshape(-1)
-    #     video_emb = np.load(video_npy_path).reshape(-1)
+    def compute_similarity(audio_npy_path: str, video_npy_path: str):
+        # Load and ensure 1D shape (768,)
+        audio_emb = np.load(audio_npy_path).reshape(-1)
+        video_emb = np.load(video_npy_path).reshape(-1)
 
-    #     print(f"🎵 Audio Vector Shape: {audio_emb.shape}")
-    #     print(f"🎬 Video Vector Shape: {video_emb.shape}")
+        print(f"🎵 Audio Vector Shape: {audio_emb.shape}")
+        print(f"🎬 Video Vector Shape: {video_emb.shape}")
 
-    #     # Cosine Similarity: (A dot B) / (||A|| * ||B||)
-    #     dot_product = np.dot(audio_emb, video_emb)
-    #     norm_a = np.linalg.norm(audio_emb)
-    #     norm_v = np.linalg.norm(video_emb)
+        # Cosine Similarity: (A dot B) / (||A|| * ||B||)
+        dot_product = np.dot(audio_emb, video_emb)
+        norm_a = np.linalg.norm(audio_emb)
+        norm_v = np.linalg.norm(video_emb)
 
-    #     cos_sim = float(dot_product / (norm_a * norm_v + 1e-8))
-    #     print(f"✨ Cosine Similarity:  {cos_sim:.4f}")
-    #     return cos_sim
+        cos_sim = float(dot_product / (norm_a * norm_v + 1e-8))
+        print(f"✨ Cosine Similarity:  {cos_sim:.4f}")
+        return cos_sim
         
-    # base_pth = "/home/hossein/Desktop/test_now"
-    # print(compute_similarity(f"{base_pth}/-0gYWIOfqdM.npy", f"{base_pth}/-0gYWIOfqdM_GEN.npy"))
-    # print("***")
-    # print(compute_similarity(f"{base_pth}/-0gYWIOfqdM.npy", f"{base_pth}/-0gYWIOfqdM_OG.npy"))
-    # print("***")
-    # print(compute_similarity(f"{base_pth}/-0gYWIOfqdM.npy", f"{base_pth}/-0gYWIOfqdM_RAW_MIX.npy"))
-    # print("***")
-    # print(compute_similarity(f"{base_pth}/-jxXv_SoNaI.npy", f"{base_pth}/-0gYWIOfqdM.npy"))
-    # print("***")
-    # print(compute_similarity(f"{base_pth}/-0gYWIOfqdM_OG.npy", f"{base_pth}/-jxXv_SoNaI_OG.npy"))
-    # print("***")
-    # print(compute_similarity(f"{base_pth}/-jxXv_SoNaI.npy", f"{base_pth}/-jxXv_SoNaI_OG.npy"))
+    base_pth = "/home/hossein/Desktop/test_now"
+    print(compute_similarity(f"{base_pth}/-0gYWIOfqdM.npy", f"{base_pth}/-0gYWIOfqdM_GEN.npy"))
+    print("***")
+    print(compute_similarity(f"{base_pth}/-0gYWIOfqdM.npy", f"{base_pth}/-0gYWIOfqdM_OG.npy"))
+    print("***")
+    print(compute_similarity(f"{base_pth}/-0gYWIOfqdM.npy", f"{base_pth}/-0gYWIOfqdM_RAW_MIX.npy"))
+    print("***")
+    print(compute_similarity(f"{base_pth}/-jxXv_SoNaI.npy", f"{base_pth}/-0gYWIOfqdM.npy"))
+    print("***")
+    print(compute_similarity(f"{base_pth}/-0gYWIOfqdM_OG.npy", f"{base_pth}/-jxXv_SoNaI_OG.npy"))
+    print("***")
+    print(compute_similarity(f"{base_pth}/-jxXv_SoNaI.npy", f"{base_pth}/-jxXv_SoNaI_OG.npy"))
     # To run as server instead, uncomment:
     # start_server(port=8000)
 
@@ -420,6 +463,6 @@ if __name__ == "__main__":
     # extract_audio_frames(
     #     input_folder= TRAIN_WAV_DIR, output_folder=TRAIN_AUDIO_EMB_DIR, ckpt_path=CAV_MAE_Scale_plusplus
     # )
-    extract_video_embeddings_from_folders(
-        parent_frames_dir=TRAIN_FRAMES_DIR, output_folder=TRAIN_VIDEO_EMB_DIR, ckpt_path= CAV_MAE_Scale_plusplus, num_frames=10
-    )
+    # extract_video_embeddings_from_folders(
+    #     parent_frames_dir=TRAIN_FRAMES_DIR, output_folder=TRAIN_VIDEO_EMB_DIR, ckpt_path= CAV_MAE_Scale_plusplus, num_frames=10
+    # )
