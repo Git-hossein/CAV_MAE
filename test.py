@@ -405,31 +405,45 @@ def load_video_from_frame_folder(
 
 def extract_video_embeddings_batched(
     parent_frames_dir: str,
-    output_folder: str,
+    output_folder_clip: str,
+    output_folder_frame: str,
     ckpt_path: str = CAV_MAE_Scale_plusplus,
     num_frames: int = 10,
-    batch_size: int = 8,  # Note: A batch of 8 means 80 images if num_frames=10
+    batch_size: int = 8,
     num_workers: int = 4,
     skip_existing: bool = True,
     l2_normalize: bool = True,
 ):
-    """Batched extraction of video embeddings with parallel CPU frame loading."""
+    """Batched extraction of video embeddings with parallel CPU frame loading.
+
+    Saves:
+      - Clip-level embeddings: shape (768,) in output_folder_clip
+      - Frame-level embeddings: shape (num_frames, 768) in output_folder_frame
+    """
     model = get_model(ckpt_path).to(device)
     model.eval()
 
     in_dir = Path(parent_frames_dir)
-    out_dir = Path(output_folder)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir_clip = Path(output_folder_clip)
+    out_dir_frame = Path(output_folder_frame)
+
+    out_dir_clip.mkdir(parents=True, exist_ok=True)
+    out_dir_frame.mkdir(parents=True, exist_ok=True)
 
     all_video_folders = sorted([d for d in in_dir.iterdir() if d.is_dir()])
     if not all_video_folders:
         print(f"⚠️ No subdirectories found in {parent_frames_dir}")
-        return {"processed": 0, "saved_to": str(out_dir)}
+        return {"processed": 0}
 
-    # Filter out already extracted files upfront
+    # Filter out folders where both clip and frame embeddings already exist
     if skip_existing:
         video_folders = [
-            f for f in all_video_folders if not (out_dir / f"{f.name}.npy").exists()
+            f
+            for f in all_video_folders
+            if not (
+                (out_dir_clip / f"{f.name}.npy").exists()
+                and (out_dir_frame / f"{f.name}.npy").exists()
+            )
         ]
         skipped_count = len(all_video_folders) - len(video_folders)
         if skipped_count > 0:
@@ -439,13 +453,12 @@ def extract_video_embeddings_batched(
 
     if not video_folders:
         print("✅ All videos already have embeddings. Nothing to process.")
-        return {"processed": 0, "saved_to": str(out_dir)}
+        return {"processed": 0}
 
     print(
         f"▶️ Processing {len(video_folders)} videos (Batch Size: {batch_size}, Frames/Vid: {num_frames}, Workers: {num_workers})..."
     )
 
-    # Initialize PyTorch Dataset & DataLoader
     dataset = VideoFramesDataset(video_folders, num_frames=num_frames)
     loader = DataLoader(
         dataset,
@@ -460,9 +473,11 @@ def extract_video_embeddings_batched(
     for batch_videos, batch_names in loader:
         # batch_videos shape: [B, num_frames, 3, 224, 224]
         B, n_f, C, H, W = batch_videos.shape
-        
+
         # Flatten batch and frame dimensions for the ViT -> [B * num_frames, 3, 224, 224]
-        batch_videos = batch_videos.view(B * n_f, C, H, W).to(device, non_blocking=True)
+        batch_videos = batch_videos.view(B * n_f, C, H, W).to(
+            device, non_blocking=True
+        )
 
         with torch.no_grad():
             # 1. Batched forward pass -> [B * num_frames, 196, 768]
@@ -477,25 +492,40 @@ def extract_video_embeddings_batched(
             # 4. Temporal pooling: Mean across num_frames (dim=1) -> [B, 768]
             video_embs = frame_embs.mean(dim=1)
 
-            # 5. L2 normalization across embedding dimension
+            # 5. L2 normalization
             if l2_normalize:
-                video_embs = F.normalize(video_embs, dim=-1)
+                # Frame-level: normalize each of the 10 vectors along embedding dimension -> [B, num_frames, 768]
+                frame_embs_norm = F.normalize(frame_embs, dim=-1)
+                # Clip-level: normalize the temporally-pooled vector -> [B, 768]
+                video_embs_norm = F.normalize(video_embs, dim=-1)
+            else:
+                frame_embs_norm = frame_embs
+                video_embs_norm = video_embs
 
             # Move batch embeddings to CPU
-            video_embs = video_embs.cpu().numpy()
+            frame_embs_np = frame_embs_norm.cpu().numpy()
+            video_embs_np = video_embs_norm.cpu().numpy()
 
-        # 6. Save each vector individually as .npy
-        for emb, folder_name in zip(video_embs, batch_names):
-            out_file = out_dir / f"{folder_name}.npy"
-            np.save(str(out_file), emb)
+        # 6. Save each pair individually as .npy
+        for clip_emb, frame_mat, folder_name in zip(
+            video_embs_np, frame_embs_np, batch_names
+        ):
+            np.save(str(out_dir_clip / f"{folder_name}.npy"), clip_emb)
+            np.save(str(out_dir_frame / f"{folder_name}.npy"), frame_mat)
             saved_count += 1
 
-        print(f" Saved {saved_count}/{len(video_folders)} embeddings...", end="\r")
+        print(
+            f" Saved {saved_count}/{len(video_folders)} videos...",
+            end="\r",
+            flush=True,
+        )
 
     print(
-        f"\n✅ Finished! Saved {saved_count} video embeddings to: {output_folder}"
+        f"\n✅ Finished! Saved {saved_count} clip and frame embeddings to:\n   - {out_dir_clip}\n   - {out_dir_frame}"
     )
-    return {"processed": saved_count, "saved_to": str(output_folder)}
+    return {"processed": saved_count}
+
+
 # =====================================================================
 # 4. FASTAPI LOCAL SERVER (Modern Lifespan Pattern)
 # =====================================================================
