@@ -11,6 +11,7 @@ import torchvision.transforms as T
 import torchaudio
 import uvicorn
 import soundfile as sf
+from torch.utils.data import DataLoader, Dataset
 
 # Path to CAV-MAE model repository
 sys.path.append("./cav_mae")
@@ -115,6 +116,79 @@ def forward_video_only(model: torch.nn.Module, v: torch.Tensor) -> torch.Tensor:
 # 2. AUDIO BATCH EXTRACTION FUNCTION
 # =====================================================================
 
+class AudioExtractionDataset(Dataset):
+
+    def __init__(
+        self,
+        wav_paths: list,
+        target_sample_rate: int = 16000,
+        target_length: int = 1024,
+        norm_mean: float = -5.081,
+        norm_std: float = 4.4849,
+    ):
+        self.wav_paths = wav_paths
+        self.target_sample_rate = target_sample_rate
+        self.target_length = target_length
+        self.norm_mean = norm_mean
+        self.norm_std = norm_std
+
+    def __len__(self):
+        return len(self.wav_paths)
+
+    def __getitem__(self, idx):
+        wav_path = self.wav_paths[idx]
+
+        # 1. Load audio file
+        data, sr = sf.read(str(wav_path), dtype="float32")
+        waveform = torch.from_numpy(data)
+
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)  # [1, samples]
+        else:
+            waveform = waveform.t()  # [channels, samples]
+
+        # 2. Convert to mono
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # 3. Resample if necessary
+        if sr != self.target_sample_rate:
+            resampler = torchaudio.transforms.Resample(
+                sr, self.target_sample_rate
+            )
+            waveform = resampler(waveform)
+
+        # 4. Zero-center waveform
+        waveform = waveform - waveform.mean()
+
+        # 5. 128-bin Mel Filterbank
+        fbank = torchaudio.compliance.kaldi.fbank(
+            waveform,
+            htk_compat=True,
+            sample_frequency=self.target_sample_rate,
+            use_energy=False,
+            window_type="hanning",
+            num_mel_bins=128,
+            dither=0.0,
+            frame_shift=10,
+        )  # [time_frames, 128]
+
+        # 6. Pad or truncate to target_length (1024)
+        n_frames = fbank.shape[0]
+        p = self.target_length - n_frames
+        if p > 0:
+            pad = torch.nn.ZeroPad2d((0, 0, 0, p))
+            fbank = pad(fbank)
+        elif p < 0:
+            fbank = fbank[: self.target_length, :]
+
+        # 7. CAV-MAE AudioSet Normalization
+        fbank = (fbank - self.norm_mean) / self.norm_std
+
+        # Shape returned per item: [1024, 128]
+        return fbank, str(wav_path)
+
+
 def preprocess_audio(
     wav_path: str,
     target_sample_rate: int = 16000,
@@ -170,68 +244,90 @@ def preprocess_audio(
     # Shape: [1, 1024, 128]
     return fbank.unsqueeze(0)
 
-
-def extract_audio_frames(
+def extract_audio_frames_batched(
     input_folder: str,
     output_folder: str,
     ckpt_path: str = CAV_MAE_Scale_plusplus,
+    batch_size: int = 32,
+    num_workers: int = 4,
     skip_existing: bool = True,
     l2_normalize: bool = True,
 ):
-    """Iterates over all .wav files in input_folder, extracts CAV-MAE pooled embeddings,
-
-    and saves matching .npy files of shape (768,).
-    """
-    model = get_model(ckpt_path)
+    """Batched extraction of audio embeddings with parallel CPU preprocessing."""
+    model = get_model(ckpt_path).to(device)
+    model.eval()
 
     in_dir = Path(input_folder)
     out_dir = Path(output_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    wav_files = sorted(list(in_dir.glob("*.wav")))
-    if not wav_files:
+    all_wav_files = sorted(list(in_dir.glob("*.wav")))
+    if not all_wav_files:
         print(f"⚠️ No .wav files found in {input_folder}")
         return {"processed": 0, "saved_to": str(out_dir)}
 
-    print(f"▶️ Found {len(wav_files)} audio files. Starting extraction...")
+    # Filter out already extracted files upfront
+    if skip_existing:
+        wav_files = [
+            p for p in all_wav_files if not (out_dir / f"{p.stem}.npy").exists()
+        ]
+        skipped_count = len(all_wav_files) - len(wav_files)
+        if skipped_count > 0:
+            print(f"⏭️ Skipping {skipped_count} already extracted files.")
+    else:
+        wav_files = all_wav_files
 
-    saved_count = 0
-    for wav_file in wav_files:
-        out_file = out_dir / f"{wav_file.stem}.npy"
-
-        if skip_existing and out_file.exists():
-            print(f"⏭️ Embedding for {wav_file.name} already exists. Skipping...")
-            continue
-
-        try:
-            # 1. Preprocess audio: [1, 1024, 128]
-            audio_tensor = preprocess_audio(str(wav_file)).to(device)
-
-            # 3. Extract features via forward_feat
-            with torch.no_grad():
-                audio_tokens = forward_audio_only(model, audio_tensor)
-
-                # Mean-pool over 512 patch tokens -> [1, 768]
-                audio_emb = audio_tokens.mean(dim=1)
-
-                # L2-normalize for cosine similarity retrieval
-                if l2_normalize:
-                    audio_emb = F.normalize(audio_emb, dim=-1)
-
-                audio_emb = audio_emb.squeeze(0).cpu().numpy()
-
-            # 4. Save as .npy
-            np.save(str(out_file), audio_emb)
-            print(f"🎵saved audio embedding for {wav_file.name}")
-            saved_count += 1
-
-        except Exception as e:
-            print(f"❌ Failed processing {wav_file.name}: {e}")
+    if not wav_files:
+        print("✅ All files already have embeddings. Nothing to process.")
+        return {"processed": 0, "saved_to": str(out_dir)}
 
     print(
-        f"✅ Finished! Saved {saved_count}/{len(wav_files)} embeddings to: {out_dir}"
+        f"▶️ Processing {len(wav_files)} files (Batch Size: {batch_size}, Workers: {num_workers})..."
     )
-    return {"processed": saved_count, "saved_to": str(out_dir)}
+
+    # Initialize PyTorch Dataset & DataLoader
+    dataset = AudioExtractionDataset(wav_files)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    saved_count = 0
+    for batch_fbanks, batch_paths in loader:
+        # batch_fbanks shape: [B, 1024, 128]
+        batch_fbanks = batch_fbanks.to(device, non_blocking=True)
+
+        with torch.no_grad():
+            # 1. Batched forward pass through audio branch -> [B, 512, 768]
+            audio_tokens = forward_audio_only(model, batch_fbanks)
+
+            # 2. Mean-pool across 512 patch tokens -> [B, 768]
+            audio_embs = audio_tokens.mean(dim=1)
+
+            # 3. L2 normalization across embedding dimension
+            if l2_normalize:
+                audio_embs = F.normalize(audio_embs, dim=-1)
+
+            # Move batch embeddings to CPU
+            audio_embs = audio_embs.cpu().numpy()
+
+        # 4. Save each vector individually as .npy
+        for emb, path_str in zip(audio_embs, batch_paths):
+            stem = Path(path_str).stem
+            out_file = out_dir / f"{stem}.npy"
+            np.save(str(out_file), emb)
+            saved_count += 1
+
+        print(f" Saved {saved_count}/{len(wav_files)} embeddings...", end="\r")
+
+    print(
+        f"\n✅ Finished! Saved {saved_count} audio embeddings to: {output_folder}"
+    )
+    return {"processed": saved_count, "saved_to": str(output_folder)}
 
 # =====================================================================
 # 3. VIDEO BATCH EXTRACTION FUNCTION
@@ -248,6 +344,37 @@ video_transform = T.Compose(
     ]
 )
 
+class VideoFramesDataset(Dataset):
+    def __init__(self, video_folders: list, num_frames: int = 10):
+        self.video_folders = video_folders
+        self.num_frames = num_frames
+
+    def __len__(self):
+        return len(self.video_folders)
+
+    def __getitem__(self, idx):
+        folder_path = self.video_folders[idx]
+        
+        # Support both .jpg and .jpeg
+        frame_paths = sorted(
+            list(folder_path.glob("*.jpg")) + list(folder_path.glob("*.jpeg"))
+        )
+        total_frames = len(frame_paths)
+
+        if total_frames == 0:
+            raise ValueError(f"No frames found in: {folder_path}")
+
+        # Uniform sampling across time
+        indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
+
+        frames = []
+        for i in indices:
+            with Image.open(frame_paths[i]) as img:
+                frames.append(video_transform(img.convert("RGB")))
+
+        # Shape returned per item: [num_frames, 3, 224, 224]
+        video_tensor = torch.stack(frames, dim=0)
+        return video_tensor, folder_path.name
 
 def load_video_from_frame_folder(
     frame_dir: Path, num_frames: int = 5, device: torch.device = None
@@ -276,19 +403,17 @@ def load_video_from_frame_folder(
         video_tensor = video_tensor.to(device)
     return video_tensor
 
-
-def extract_video_embeddings_from_folders(
+def extract_video_embeddings_batched(
     parent_frames_dir: str,
     output_folder: str,
     ckpt_path: str = CAV_MAE_Scale_plusplus,
-    num_frames: int = 5,
+    num_frames: int = 10,
+    batch_size: int = 8,  # Note: A batch of 8 means 80 images if num_frames=10
+    num_workers: int = 4,
     skip_existing: bool = True,
     l2_normalize: bool = True,
 ):
-    """Iterates over each video subfolder, extracts pooled 768-d video embeddings,
-
-    and saves matching .npy files.
-    """
+    """Batched extraction of video embeddings with parallel CPU frame loading."""
     model = get_model(ckpt_path).to(device)
     model.eval()
 
@@ -296,57 +421,81 @@ def extract_video_embeddings_from_folders(
     out_dir = Path(output_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    video_folders = sorted([d for d in in_dir.iterdir() if d.is_dir()])
-    if not video_folders:
+    all_video_folders = sorted([d for d in in_dir.iterdir() if d.is_dir()])
+    if not all_video_folders:
         print(f"⚠️ No subdirectories found in {parent_frames_dir}")
         return {"processed": 0, "saved_to": str(out_dir)}
 
+    # Filter out already extracted files upfront
+    if skip_existing:
+        video_folders = [
+            f for f in all_video_folders if not (out_dir / f"{f.name}.npy").exists()
+        ]
+        skipped_count = len(all_video_folders) - len(video_folders)
+        if skipped_count > 0:
+            print(f"⏭️ Skipping {skipped_count} already extracted videos.")
+    else:
+        video_folders = all_video_folders
+
+    if not video_folders:
+        print("✅ All videos already have embeddings. Nothing to process.")
+        return {"processed": 0, "saved_to": str(out_dir)}
+
     print(
-        f"▶️ Found {len(video_folders)} video directories. Starting extraction..."
+        f"▶️ Processing {len(video_folders)} videos (Batch Size: {batch_size}, Frames/Vid: {num_frames}, Workers: {num_workers})..."
+    )
+
+    # Initialize PyTorch Dataset & DataLoader
+    dataset = VideoFramesDataset(video_folders, num_frames=num_frames)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
     )
 
     saved_count = 0
-    for folder in video_folders:
-        out_file = out_dir / f"{folder.name}.npy"
-        if skip_existing and out_file.exists():
-            print(f"⏭️ Embedding for {folder.name} already exists. Skipping...")
-            continue
+    for batch_videos, batch_names in loader:
+        # batch_videos shape: [B, num_frames, 3, 224, 224]
+        B, n_f, C, H, W = batch_videos.shape
+        
+        # Flatten batch and frame dimensions for the ViT -> [B * num_frames, 3, 224, 224]
+        batch_videos = batch_videos.view(B * n_f, C, H, W).to(device, non_blocking=True)
 
-        try:
-            # 1. Load and transform frames -> [num_frames, 3, 224, 224]
-            video_tensor = load_video_from_frame_folder(
-                folder, num_frames=num_frames, device=device
-            )
+        with torch.no_grad():
+            # 1. Batched forward pass -> [B * num_frames, 196, 768]
+            video_tokens = forward_video_only(model, batch_videos)
 
-            # 2. Extract features
-            with torch.no_grad():
-                # video_tokens shape: [num_frames, 196, 768]
-                video_tokens = forward_video_only(model, video_tensor)
+            # 2. Reshape back to separate batch and frames -> [B, num_frames, 196, 768]
+            video_tokens = video_tokens.view(B, n_f, 196, -1)
 
-                # Mean pool across 196 spatial tokens per frame -> [num_frames, 768]
-                frame_embs = video_tokens.mean(dim=1)
+            # 3. Spatial pooling: Mean across 196 spatial tokens (dim=2) -> [B, num_frames, 768]
+            frame_embs = video_tokens.mean(dim=2)
 
-                # Mean pool across time (the num_frames) -> [1, 768]
-                video_emb = frame_embs.mean(dim=0, keepdim=True)
+            # 4. Temporal pooling: Mean across num_frames (dim=1) -> [B, 768]
+            video_embs = frame_embs.mean(dim=1)
 
-                # L2 normalize for cosine similarity alignment with audio
-                if l2_normalize:
-                    video_emb = F.normalize(video_emb, dim=-1)
+            # 5. L2 normalization across embedding dimension
+            if l2_normalize:
+                video_embs = F.normalize(video_embs, dim=-1)
 
-                video_emb = video_emb.squeeze(0).cpu().numpy()  # [768]
+            # Move batch embeddings to CPU
+            video_embs = video_embs.cpu().numpy()
 
-            # 3. Save as .npy
-            np.save(str(out_file), video_emb)
-            print(f"🎬saved video embedding for {folder.name}")
+        # 6. Save each vector individually as .npy
+        for emb, folder_name in zip(video_embs, batch_names):
+            out_file = out_dir / f"{folder_name}.npy"
+            np.save(str(out_file), emb)
             saved_count += 1
 
-        except Exception as e:
-            print(f"❌ Failed processing {folder.name}: {e}")
+        print(f" Saved {saved_count}/{len(video_folders)} embeddings...", end="\r")
 
     print(
-        f"✅ Finished! Saved {saved_count}/{len(video_folders)} video embeddings to: {out_dir}"
+        f"\n✅ Finished! Saved {saved_count} video embeddings to: {output_folder}"
     )
-    return {"processed": saved_count, "saved_to": str(out_dir)}
+    return {"processed": saved_count, "saved_to": str(output_folder)}
 # =====================================================================
 # 4. FASTAPI LOCAL SERVER (Modern Lifespan Pattern)
 # =====================================================================
@@ -375,7 +524,7 @@ class BatchAudioRequest(BaseModel):
 @app.post("/extract_audio_batch")
 def api_extract_audio(request: BatchAudioRequest):
     try:
-        result = extract_audio_frames(
+        result = extract_audio_frames_batched(
             input_folder=request.input_folder,
             output_folder=request.output_folder,
             ckpt_path=request.checkpoint_path or None,
@@ -395,7 +544,7 @@ class BatchVideoRequest(BaseModel):
 @app.post("/extract_video_batch")
 def api_extract_video(request: BatchVideoRequest):
     try:
-        result = extract_video_embeddings_from_folders(
+        result = extract_video_embeddings_batched(
             parent_frames_dir=request.input_folder,
             output_folder=request.output_folder,
             ckpt_path=request.checkpoint_path or None,
