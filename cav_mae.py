@@ -153,10 +153,7 @@ class AudioExtractionDataset(Dataset):
 
         # 3. Resample if necessary
         if sr != self.target_sample_rate:
-            resampler = torchaudio.transforms.Resample(
-                sr, self.target_sample_rate
-            )
-            waveform = resampler(waveform)
+            raise ValueError(f"Expected {self.target_sample_rate}Hz, but {wav_path} is {sr}Hz.")
 
         # 4. Zero-center waveform
         waveform = waveform - waveform.mean()
