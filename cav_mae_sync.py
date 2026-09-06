@@ -126,6 +126,65 @@ def wav_to_fbank(wav_path: str, target_length: int = 1024, num_mel_bins: int = N
     return fbank
 
 
+
+@torch.no_grad()
+def forward_audio_only(model: CAVMAE, a: torch.Tensor) -> torch.Tensor:
+    """
+    Forward audio filterbanks without processing visual tokens.
+    
+    Args:
+        model (CAVMAE): The loaded CAV-MAE Sync model.
+        a (torch.Tensor): Audio filterbanks of shape [N, 416, 128], 
+                          where N can be 16 (1 clip) or B * 16 (batched clips).
+                          
+    Returns:
+        torch.Tensor: L2-normalized frame-level audio CLS embeddings of shape [N, 768].
+    """
+    # 1. Patchify & add positional + modality embeddings
+    a = a.unsqueeze(1)               # [N, 1, 416, 128]
+    a = a.transpose(2, 3)            # [N, 1, 128, 416]
+    a = model.patch_embed_a(a)       # [N, num_patches, 768]
+    a = a + model.pos_embed_a
+    a = a + model.modality_a
+
+    batch_size = a.shape[0]
+
+    # 2. Append CLS token
+    if model.cls_token:
+        cls_tokens_a = model.cls_token_a.expand(batch_size, -1, -1)
+        a = torch.cat([cls_tokens_a, a], dim=1)
+
+    # 3. Append register tokens
+    if model.num_register_tokens > 0:
+        r_a = model.register_tokens[:model.num_register_tokens].unsqueeze(0).expand(batch_size, -1, -1)
+        a = torch.cat([a, r_a], dim=1)
+
+    # 4. Modality-specific audio transformer blocks (11 blocks)
+    for blk in model.blocks_a:
+        a = blk(a)
+
+    # 5. Drop register tokens
+    if model.num_register_tokens > 0 and not model.keep_register_tokens:
+        a = a[:, :-model.num_register_tokens, :]
+
+    # 6. Unified transformer blocks with modality='a' (1 block)
+    ca = a
+    for blk in model.blocks_u:
+        ca = blk(ca, 'a')
+
+    # 7. Contrastive heads (if active in checkpoint config)
+    if model.contrastive_heads:
+        for blk in model.constrative_head_audio:
+            ca = blk(ca)
+
+    # 8. Extract CLS token, apply modality LayerNorm, and L2 normalize
+    cls_a = model.norm_a(ca[:, 0, :])
+    audio_emb = F.normalize(cls_a, dim=-1)
+
+    return audio_emb
+
+
+
 @torch.no_grad()
 def extract_audio_embeddings(
     wav_path: str,
@@ -158,17 +217,10 @@ def extract_audio_embeddings(
     # Shape: [16, 416, 128]
     audio_input = torch.stack(fbanks).to(device)
 
-    # 3. Create dummy video input to satisfy the joint forward_feat signature
-    # Shape: [16, 3, 224, 224]
-    dummy_video = torch.zeros((num_frames, 3, 224, 224), device=device)
-
     # 4. Forward through the network
-    with torch.amp.autocast(device_type=device.type):
-        # forward_feat signature with cls_token=True returns: (ca, cv, cls_a, cls_v)
-        tokens_audio, tokens_video, cls_audio, cls_video = model.forward_feat(audio_input, dummy_video)
-
-        # L2-normalize across embedding dimension
-        audio_emb = torch.nn.functional.normalize(cls_audio, dim=-1)
+    with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+        # Direct audio forward
+        audio_emb = forward_audio_only(model, audio_input)
 
     # Shape: [16, 768] on CPU
     return audio_emb.cpu()
@@ -218,6 +270,63 @@ def load_and_sample_frames(frame_dir: str, num_frames: int = 16) -> torch.Tensor
     return torch.stack(tensors)  # [16, 3, 224, 224]
 
 
+
+@torch.no_grad()
+def forward_video_only(model: CAVMAE, v: torch.Tensor) -> torch.Tensor:
+    """
+    Forward video frames without processing audio filterbanks.
+    
+    Args:
+        model (CAVMAE): The loaded CAV-MAE Sync model.
+        v (torch.Tensor): Video frame tensors of shape [N, 3, 224, 224], 
+                          where N can be 16 (1 clip) or B * 16 (batched clips).
+                          
+    Returns:
+        torch.Tensor: L2-normalized frame-level visual CLS embeddings of shape [N, 768].
+    """
+    # 1. Patchify & add positional + modality embeddings
+    v = model.patch_embed_v(v)       # [N, 196, 768]
+    v = v + model.pos_embed_v
+    v = v + model.modality_v
+
+    batch_size = v.shape[0]
+
+    # 2. Append CLS token
+    if model.cls_token:
+        cls_tokens_v = model.cls_token_v.expand(batch_size, -1, -1)
+        v = torch.cat([cls_tokens_v, v], dim=1)
+
+    # 3. Append register tokens
+    if model.num_register_tokens > 0:
+        r_v = model.register_tokens[model.num_register_tokens:].unsqueeze(0).expand(batch_size, -1, -1)
+        v = torch.cat([v, r_v], dim=1)
+
+    # 4. Modality-specific visual transformer blocks (11 blocks)
+    for blk in model.blocks_v:
+        v = blk(v)
+
+    # 5. Drop register tokens
+    if model.num_register_tokens > 0 and not model.keep_register_tokens:
+        v = v[:, :-model.num_register_tokens, :]
+
+    # 6. Unified transformer blocks with modality='v' (1 block)
+    cv = v
+    for blk in model.blocks_u:
+        cv = blk(cv, 'v')
+
+    # 7. Contrastive heads (if active in checkpoint config)
+    if model.contrastive_heads:
+        for blk in model.constrative_head_visual:
+            cv = blk(cv)
+
+    # 8. Extract CLS token, apply modality LayerNorm, and L2 normalize
+    cls_v = model.norm_v(cv[:, 0, :])
+    video_emb = F.normalize(cls_v, dim=-1)
+
+    return video_emb
+
+
+
 @torch.no_grad()
 def extract_video_embeddings(
     frame_dir: str,
@@ -233,17 +342,10 @@ def extract_video_embeddings(
     # 1. Load and transform the 16 video frames -> [16, 3, 224, 224]
     video_input = load_and_sample_frames(frame_dir, num_frames=num_frames).to(device)
 
-    # 2. Create dummy audio input to satisfy forward_feat signature
-    # Shape: [16, target_audio_len, 128]
-    dummy_audio = torch.zeros((num_frames, target_audio_len, 128), device=device)
-
     # 3. Forward pass
-    with torch.amp.autocast(device_type=device.type):
+    with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
         # forward_feat returns: (ca, cv, cls_a, cls_v)
-        tokens_audio, tokens_video, cls_audio, cls_video = model.forward_feat(dummy_audio, video_input)
-
-        # L2-normalize visual CLS embeddings across the 768 dim
-        video_emb = torch.nn.functional.normalize(cls_video, dim=-1)
+        video_emb = forward_video_only(model, video_input)
 
     # Output shape: [16, 768] on CPU
     return video_emb.cpu()
