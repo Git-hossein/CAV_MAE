@@ -194,11 +194,6 @@ image_preprocess = T.Compose([
 ])
 
 
-def natural_sort_key(s: str):
-    """Sort filenames containing numbers in human order (frame_1, frame_2, ..., frame_10)."""
-    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
-
-
 def load_and_sample_frames(frame_dir: str, num_frames: int = 16) -> torch.Tensor:
     # Match all jpg frames and sort directly
     frame_paths = sorted(glob.glob(os.path.join(frame_dir, "frame_*.jpg")))
