@@ -1,3 +1,7 @@
 cav_env/
 cav_mae/
 cav_sync_env/
+__pycache__/
+audio_model.21.pth
+cav-mae-sync/
+cav_mae_sync.pth
