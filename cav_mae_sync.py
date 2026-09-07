@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
 import torchaudio
 from pathlib import Path
 import torchvision.transforms as T
@@ -125,7 +126,41 @@ def wav_to_fbank(wav_path: str, target_length: int = 1024, num_mel_bins: int = N
 
     return fbank
 
+class AudioClipsDataset(Dataset):
+    def __init__(self, audio_dir: str, output_dir: str, num_frames: int = 16, target_length: int = 416):
+        self.num_frames = num_frames
+        self.target_length = target_length
+        os.makedirs(output_dir, exist_ok=True)
 
+        wav_files = [f for f in os.listdir(audio_dir) if f.endswith(".wav")]
+        
+        self.audio_files = []
+        for fname in sorted(wav_files):
+            clip_id = os.path.splitext(fname)[0]
+            if not os.path.exists(os.path.join(output_dir, f"{clip_id}.npy")):
+                self.audio_files.append((os.path.join(audio_dir, fname), clip_id))
+
+    def __len__(self):
+        return len(self.audio_files)
+
+    def __getitem__(self, idx):
+        wav_path, clip_id = self.audio_files[idx]
+        full_fbank = wav_to_fbank(wav_path, target_length=1024)
+
+        fbanks = []
+        for frame_idx in range(self.num_frames):
+            start, end = map_frame_to_spectrogram(
+                frame_index=frame_idx,
+                num_frames=self.num_frames,
+                spectrogram_length=full_fbank.shape[0],
+                target_length=self.target_length
+            )
+            slice_fbank = full_fbank[start:end, :]
+            slice_fbank = (slice_fbank - VGGSOUND_MEAN) / VGGSOUND_STD
+            fbanks.append(slice_fbank)
+
+        # Shape: [16, 416, 128]
+        return torch.stack(fbanks), clip_id
 
 @torch.no_grad()
 def forward_audio_only(model: CAVMAE, a: torch.Tensor) -> torch.Tensor:
@@ -227,7 +262,43 @@ def extract_audio_embeddings(
 
 
 
+@torch.no_grad()
+def batch_extract_audio_dataset(
+    audio_dir: str,
+    output_dir: str,
+    model: CAVMAE,
+    batch_size: int = 8,
+    num_workers: int = 4,
+    device: torch.device = device
+):
+    dataset = AudioClipsDataset(audio_dir, output_dir, num_frames=NUM_FRAMES, target_length=TARGET_LENGTH)
+    if len(dataset) == 0:
+        print("All audio embeddings already computed.")
+        return
 
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda")
+    )
+
+    print(f"Extracting audio embeddings for {len(dataset)} clips (Batch size: {batch_size}, Workers: {num_workers})...")
+
+    for batch_audios, batch_ids in loader:
+        B, N, T_len, Mel = batch_audios.shape
+        # Flatten batch: [B * 16, 416, 128]
+        flat_audios = batch_audios.view(B * N, T_len, Mel).to(device)
+
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            flat_embs = forward_audio_only(model, flat_audios)  # [B * 16, 768]
+
+        # Reshape back to individual clips: [B, 16, 768]
+        embs = flat_embs.view(B, N, -1).cpu().numpy()
+
+        for emb, clip_id in zip(embs, batch_ids):
+            np.save(os.path.join(output_dir, f"{clip_id}.npy"), emb)
 
 
 
@@ -265,9 +336,38 @@ def load_and_sample_frames(frame_dir: str, num_frames: int = 16) -> torch.Tensor
     tensors = []
     for path in selected_paths:
         with Image.open(path) as img:
-            tensors.append(image_preprocess(img.convert("RGB")))
+            rgb_img = img.convert("RGB")
+            tensors.append(image_preprocess(rgb_img))
 
     return torch.stack(tensors)  # [16, 3, 224, 224]
+
+
+
+class VideoClipsDataset(Dataset):
+    def __init__(self, parent_dir: str, output_dir: str, num_frames: int = 16):
+        self.num_frames = num_frames
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Discover all subdirectories
+        subfolders = [
+            d for d in os.listdir(parent_dir)
+            if os.path.isdir(os.path.join(parent_dir, d))
+        ]
+        
+        # Filter out clips already saved (resume support)
+        self.clip_dirs = []
+        for name in sorted(subfolders):
+            if not os.path.exists(os.path.join(output_dir, f"{name}.npy")):
+                self.clip_dirs.append((os.path.join(parent_dir, name), name))
+
+    def __len__(self):
+        return len(self.clip_dirs)
+
+    def __getitem__(self, idx):
+        folder_path, clip_id = self.clip_dirs[idx]
+        # Reuse the standalone function instead of duplicating code
+        video_tensor = load_and_sample_frames(folder_path, num_frames=self.num_frames)
+        return video_tensor, clip_id
 
 
 
@@ -351,9 +451,49 @@ def extract_video_embeddings(
     return video_emb.cpu()
 
 
+@torch.no_grad()
+def batch_extract_video_dataset(
+    parent_dir: str,
+    output_dir: str,
+    model: CAVMAE,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    device: torch.device = device
+):
+    dataset = VideoClipsDataset(parent_dir, output_dir, num_frames=NUM_FRAMES)
+    if len(dataset) == 0:
+        print("All video embeddings already computed.")
+        return
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda")
+    )
+
+    print(f"Extracting video embeddings for {len(dataset)} clips (Batch size: {batch_size}, Workers: {num_workers})...")
+    
+    for batch_videos, batch_ids in loader:
+        B, N, C, H, W = batch_videos.shape
+        # Flatten batch: [B * 16, 3, 224, 224]
+        flat_videos = batch_videos.view(B * N, C, H, W).to(device)
+
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            flat_embs = forward_video_only(model, flat_videos)  # [B * 16, 768]
+
+        # Reshape back to individual clips: [B, 16, 768]
+        embs = flat_embs.view(B, N, -1).cpu().numpy()
+
+        for emb, clip_id in zip(embs, batch_ids):
+            np.save(os.path.join(output_dir, f"{clip_id}.npy"), emb)
 
 
 if __name__ == "__main__":
+
+    torch.set_num_threads(max(1, os.cpu_count() // 2))
+    
     # Quick sanity test
     model = load_cav_mae_sync("./cav_mae_sync.pth")
     print("Model ready.")
