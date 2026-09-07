@@ -484,7 +484,7 @@ def extract_video_embeddings_batched(
             video_tokens = video_tokens.view(B, n_f, 196, -1)
 
             # 3. Spatial pooling: Mean across 196 spatial tokens (dim=2) -> [B, num_frames, 768]
-            frame_embs = video_tokens.mean(dim=2)
+            frame_embs = video_tokens.mean(dim=2) #TODO: possibly normalize each embedding sperately before meaning ?!
 
             # 4. Temporal pooling: Mean across num_frames (dim=1) -> [B, 768]
             video_embs = frame_embs.mean(dim=1)
