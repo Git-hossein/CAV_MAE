@@ -514,7 +514,7 @@ if __name__ == "__main__":
 
     # Run Audio Extraction if audio scratch folder exists and has files
     if os.path.exists(SCRATCH_INPUT_WAVS) and any(os.listdir(SCRATCH_INPUT_WAVS)):
-        print(f"🎵 Found audio data in {len(os.listdir(SCRATCH_INPUT_WAVS))}, starting audio extraction...", flush=True)
+        print(f"🎵 Found audio data in {SCRATCH_INPUT_WAVS}, starting audio extraction...", flush=True)
         batch_extract_audio_dataset(
             audio_dir=SCRATCH_INPUT_WAVS,
             output_dir=SCRATCH_OUTPUT_AUDIO_EMB,
@@ -526,7 +526,7 @@ if __name__ == "__main__":
 
     # Run Video Extraction if frames scratch folder exists and has files
     if os.path.exists(SCRATCH_INPUT_FRAMES) and any(os.listdir(SCRATCH_INPUT_FRAMES)):
-        print(f"🎬 Found frame data in {len(os.listdir(SCRATCH_INPUT_FRAMES))}, starting video extraction...", flush=True)
+        print(f"🎬 Found frame data in {SCRATCH_INPUT_FRAMES}, starting video extraction...", flush=True)
         batch_extract_video_dataset(
             parent_dir=SCRATCH_INPUT_FRAMES,
             output_dir=SCRATCH_OUTPUT_VIDEO_EMB,
