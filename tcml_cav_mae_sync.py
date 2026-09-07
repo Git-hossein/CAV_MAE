@@ -18,10 +18,6 @@ from src.models.cav_mae_sync import CAVMAE
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SCRATCH_INPUT_WAVS = os.environ.get('scratch_input_wavs')
-SCRATCH_INPUT_FRAMES = os.environ.get('scratch_input_frames')
-SCRATCH_OUTPUT_AUDIO_EMB = os.environ.get('scratch_audio_output')
-SCRATCH_OUTPUT_VIDEO_EMB = os.environ.get('scratch_video_output')
 
 
 # --- Constants from dataloader_sync & retrieval.py for VGGSound ---
@@ -133,18 +129,15 @@ def wav_to_fbank(wav_path: str, target_length: int = 1024, num_mel_bins: int = N
     return fbank
 
 class AudioClipsDataset(Dataset):
-    def __init__(self, audio_dir: str, output_dir: str, num_frames: int = 16, target_length: int = 416):
+    def __init__(self, audio_dir: str, num_frames: int = 16, target_length: int = 416):
         self.num_frames = num_frames
         self.target_length = target_length
-        os.makedirs(output_dir, exist_ok=True)
 
-        wav_files = [f for f in os.listdir(audio_dir) if f.endswith(".wav")]
-        
-        self.audio_files = []
-        for fname in sorted(wav_files):
-            clip_id = os.path.splitext(fname)[0]
-            if not os.path.exists(os.path.join(output_dir, f"{clip_id}.npy")):
-                self.audio_files.append((os.path.join(audio_dir, fname), clip_id))
+        self.audio_files = [
+                    (os.path.join(audio_dir, f), os.path.splitext(f)[0])
+                    for f in sorted(os.listdir(audio_dir))
+                    if f.endswith(".wav")
+                ]
 
     def __len__(self):
         return len(self.audio_files)
@@ -277,7 +270,8 @@ def batch_extract_audio_dataset(
     num_workers: int = 4,
     device: torch.device = device
 ):
-    dataset = AudioClipsDataset(audio_dir, output_dir, num_frames=NUM_FRAMES, target_length=TARGET_LENGTH)
+    dataset = AudioClipsDataset(audio_dir, num_frames=NUM_FRAMES, target_length=TARGET_LENGTH)
+    os.makedirs(output_dir, exist_ok=True)
     if len(dataset) == 0:
         print("All audio embeddings already computed.", flush=True)
         return
@@ -310,7 +304,7 @@ def batch_extract_audio_dataset(
         total_saved_embs += len(batch_ids)
         print(f"embeded {total_saved_embs} audios out of {total_num_clips}", end='\r', flush=True)
 
-    print(f"\n✅ Finished! Saved {total_saved_embs} video embeddings to: {output_dir}", flush=True)
+    print(f"\n✅ Finished! Saved {total_saved_embs} audio embeddings to: {output_dir}", flush=True)
 
 
 
@@ -357,21 +351,14 @@ def load_and_sample_frames(frame_dir: str, num_frames: int = 16) -> torch.Tensor
 
 
 class VideoClipsDataset(Dataset):
-    def __init__(self, parent_dir: str, output_dir: str, num_frames: int = 16):
+    def __init__(self, parent_dir: str, num_frames: int = 16):
         self.num_frames = num_frames
-        os.makedirs(output_dir, exist_ok=True)
         
-        # Discover all subdirectories
-        subfolders = [
-            d for d in os.listdir(parent_dir)
+        self.clip_dirs = [
+            (os.path.join(parent_dir, d), d)
+            for d in sorted(os.listdir(parent_dir))
             if os.path.isdir(os.path.join(parent_dir, d))
         ]
-        
-        # Filter out clips already saved (resume support)
-        self.clip_dirs = []
-        for name in sorted(subfolders):
-            if not os.path.exists(os.path.join(output_dir, f"{name}.npy")):
-                self.clip_dirs.append((os.path.join(parent_dir, name), name))
 
     def __len__(self):
         return len(self.clip_dirs)
@@ -473,7 +460,8 @@ def batch_extract_video_dataset(
     num_workers: int = 4,
     device: torch.device = device
 ):
-    dataset = VideoClipsDataset(parent_dir, output_dir, num_frames=NUM_FRAMES)
+    dataset = VideoClipsDataset(parent_dir, num_frames=NUM_FRAMES)
+    os.makedirs(output_dir, exist_ok=True)
     if len(dataset) == 0:
         print("All video embeddings already computed.", flush=True)
         return
@@ -509,6 +497,11 @@ def batch_extract_video_dataset(
     print(f"\n✅ Finished! Saved {total_saved_embs} video embeddings to: {output_dir}")
 
 if __name__ == "__main__":
+
+    SCRATCH_INPUT_WAVS = os.environ.get('scratch_input_wavs')
+    SCRATCH_INPUT_FRAMES = os.environ.get('scratch_input_frames')
+    SCRATCH_OUTPUT_AUDIO_EMB = os.environ.get('scratch_audio_output')
+    SCRATCH_OUTPUT_VIDEO_EMB = os.environ.get('scratch_video_output')
 
     torch.set_num_threads(1)
     
