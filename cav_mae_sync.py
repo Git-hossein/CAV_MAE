@@ -444,7 +444,6 @@ def extract_video_embeddings(
 
     # 3. Forward pass
     with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-        # forward_feat returns: (ca, cv, cls_a, cls_v)
         video_emb = forward_video_only(model, video_input)
 
     # Output shape: [16, 768] on CPU
@@ -492,41 +491,10 @@ def batch_extract_video_dataset(
 
 if __name__ == "__main__":
 
-    torch.set_num_threads(max(1, os.cpu_count() // 2))
+    # torch.set_num_threads(max(1, os.cpu_count() // 2))
     
-    # Quick sanity test
-    model = load_cav_mae_sync("./cav_mae_sync.pth")
-    print("Model ready.")
-    AUD_DIR = "/media/hossein/H.s.wildwildwest/Bsc.Thesis_Datasets/vggsound/training/audios"
-    VID_DIR = "/media/hossein/H.s.wildwildwest/Bsc.Thesis_Datasets/vggsound/training/frames"
-    # You can test with a sample file:
-    other_cand = ["0Sam3gPcYLk", "2myGIZCgZ2g", "-0HxntVOLW4"]
+    # # Quick sanity test
+    # model = load_cav_mae_sync("./cav_mae_sync.pth")
+    # print("Model ready.")
+    pass
 
-    aud1_emb = extract_audio_embeddings(f"{AUD_DIR}/0Sam3gPcYLk.wav", model)
-    aud2_emb = extract_audio_embeddings(f"{AUD_DIR}/2myGIZCgZ2g.wav", model)
-    aud9_emb = extract_audio_embeddings(f"{AUD_DIR}/-0HxntVOLW4.wav", model)
-
-    aud_emb = extract_audio_embeddings(f"{AUD_DIR}/-0aiCtGjNXE.wav", model)
-    print("Extracted Audio Embedding Shape:", aud_emb.shape)  # Expected: torch.Size([16, 768])
-    vid_emb = extract_video_embeddings(f"{VID_DIR}/-0aiCtGjNXE", model)
-    print("Extracted Audio Embedding Shape:", vid_emb.shape)  # Expected: torch.Size([16, 768])
-
-    for aud in [aud1_emb, aud2_emb, aud9_emb, aud_emb]:
-
-        sim_matrix = torch.mm(vid_emb, aud.t())
-        diagonal_sims = torch.diag(sim_matrix)
-
-        # 3. Compute summary statistics
-        diag_mean = diagonal_sims.mean().item()
-        diag_max = diagonal_sims.max().item()
-
-        # 4. Off-diagonal mean (misaligned moments from the same video)
-        mask = torch.eye(16, dtype=torch.bool)
-        off_diag_mean = sim_matrix[~mask].mean().item()
-
-        print("\n--- Temporal Alignment Sanity Check ---")
-        print(f"Similarity Matrix Shape: {sim_matrix.shape}")
-        print(f"\nDiagonal Mean Score: {diag_mean:.4f}")
-        print(f"Diagonal Max Score:  {diag_max:.4f}")
-        print(f"Off-Diagonal Mean:   {off_diag_mean:.4f}")
-        print(f"Sync Margin (Diag - OffDiag): {diag_mean - off_diag_mean:.4f}")
